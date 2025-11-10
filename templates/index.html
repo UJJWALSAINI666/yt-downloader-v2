@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>YouTube Downloader</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:2rem;background:#f7fafc}
+    .card{background:#fff;padding:1.25rem;border-radius:8px;max-width:760px;margin:0 auto;box-shadow:0 6px 18px rgba(0,0,0,0.06)}
+    input,select{width:100%;padding:0.6rem;margin-top:0.5rem;margin-bottom:1rem}
+    button{padding:0.6rem 1rem;cursor:pointer}
+    .progress{height:16px;background:#e5e7eb;border-radius:999px;overflow:hidden;margin-top:10px;}
+    .bar{height:100%;width:0%;background:#3b82f6;transition:width 0.2s}
+    .status{font-size:0.9rem;color:#374151;margin-top:5px;}
+    .hidden{display:none}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>YouTube Downloader</h1>
+
+    <form id="form" action="/start" method="post">
+      <label>Video URL
+        <input name="url" id="url" type="url" placeholder="https://youtu.be/..." required />
+      </label>
+
+      <label>Format
+        <select name="type" id="type">
+          <option value="mp4">MP4 (Video)</option>
+          <option value="mp3">MP3 (Audio)</option>
+        </select>
+      </label>
+
+      <button type="submit" id="btn">Start Download</button>
+    </form>
+
+    <div id="progressBox" class="hidden">
+      <p class="status" id="status">Starting...</p>
+      <div class="progress">
+        <div class="bar" id="bar"></div>
+      </div>
+      <p class="status" id="detail"></p>
+    </div>
+
+    <hr />
+    <p style="font-size:0.9rem;color:#475569">
+      This downloader supports MP4 up to 4K and MP3 audio.  
+      The file will download after processing completes.
+    </p>
+  </div>
+
+<script>
+const form = document.getElementById('form');
+const btn = document.getElementById('btn');
+const box = document.getElementById('progressBox');
+const bar = document.getElementById('bar');
+const statusEl = document.getElementById('status');
+const detailEl = document.getElementById('detail');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  btn.disabled = true;
+  box.classList.remove('hidden');
+
+  const data = new FormData(form);
+  const res = await fetch('/start', { method: 'POST', body: data });
+  const json = await res.json().catch(() => ({}));
+
+  if (!json.ok) {
+    statusEl.textContent = json.error || 'Failed to start.';
+    btn.disabled = false;
+    return;
+  }
+
+  const jobId = json.job_id;
+  const es = new EventSource(`/progress/${jobId}`);
+
+  es.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+
+    if (msg.status) statusEl.textContent = msg.status;
+    if (msg.progress && msg.progress.percent !== undefined) {
+      bar.style.width = `${msg.progress.percent}%`;
+      detailEl.textContent = `${msg.progress.percent}%`;
+    }
+    if (msg.progress && msg.progress.text) {
+      detailEl.textContent = msg.progress.text;
+    }
+
+    if (msg.status === 'done') {
+      es.close();
+      statusEl.textContent = 'Done! Preparing download...';
+      window.location = `/file/${jobId}`;
+      setTimeout(() => (btn.disabled = false), 1500);
+    }
+
+    if (msg.status === 'error') {
+      es.close();
+      statusEl.textContent = 'Error: ' + (msg.error || 'Unknown');
+      btn.disabled = false;
+    }
+  };
+});
+</script>
+</body>
+</html>
