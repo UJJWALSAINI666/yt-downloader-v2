@@ -99,10 +99,17 @@ def progress_hook_factory(job_id):
 def index():
     return render_template("index.html")
 
+# Conditional limiter decorator helper
+def maybe_limit(rate):
+    if HAS_LIMITER:
+        return limiter.limit(rate)
+    # no-op decorator when limiter missing
+    def _noop(f):
+        return f
+    return _noop
+
 @app.route("/start", methods=["POST"])
-@if HAS_LIMITER
-@limiter.limit("3 per minute")
-@endif
+@maybe_limit("3 per minute")
 @single_concurrent
 def start():
     url = request.form.get("url", "").strip()
