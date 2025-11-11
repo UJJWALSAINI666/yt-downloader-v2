@@ -2,32 +2,30 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Dict, Any, List, Optional
-from flask import Flask, render_template, request, jsonify, send_file, abort, after_this_request
+from typing import Dict, Any, Optional
+from flask import (
+    Flask, render_template, request, jsonify,
+    send_file, abort, after_this_request
+)
 from yt_dlp import YoutubeDL
+from threading import Semaphore
 
 app = Flask(__name__)
+app.config["USE_X_SENDFILE"] = False  # extra safety
 
 # ---------- Config ----------
 MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", "0"))  # 0 = no limit
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
 ENABLE_AUDIO_MP3 = True  # requires ffmpeg
 
-# simple in-process concurrency guard
-from threading import Semaphore
 _sem = Semaphore(MAX_CONCURRENT)
-
 
 # ---------- FFmpeg detection ----------
 def ffmpeg_path() -> Optional[str]:
     return os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg")
 
-
-# ---------- Cookies helper ----------
+# ---------- Cookies helpers ----------
 def _write_env_cookies(tmpdir: str) -> Optional[str]:
-    """
-    If COOKIES_TEXT env exists, write it to tmpdir/cookies.txt and return path.
-    """
     txt = os.environ.get("COOKIES_TEXT", "").strip()
     if not txt:
         return None
@@ -35,25 +33,16 @@ def _write_env_cookies(tmpdir: str) -> Optional[str]:
     p.write_text(txt, encoding="utf-8")
     return str(p)
 
-
 def _save_uploaded_cookiefile(tmpdir: str) -> Optional[str]:
-    """
-    Save uploaded cookie file from form field named 'cookies' (file upload).
-    Return file path or None.
-    """
-    if 'cookies' in request.files:
-        f = request.files['cookies']
+    if "cookies" in request.files:
+        f = request.files["cookies"]
         if f and f.filename:
             dest = Path(tmpdir) / f.filename
             f.save(str(dest))
             return str(dest)
     return None
 
-
 def _save_cookies_from_textfield(tmpdir: str) -> Optional[str]:
-    """
-    If client posts cookies text in 'cookies_text' field, write it and return path.
-    """
     text = (request.form.get("cookies_text") or "").strip()
     if not text:
         return None
@@ -61,26 +50,17 @@ def _save_cookies_from_textfield(tmpdir: str) -> Optional[str]:
     dest.write_text(text, encoding="utf-8")
     return str(dest)
 
-
 def attach_cookiefile_to_opts(opts: Dict[str, Any], tmpdir: str):
-    """
-    Look for cookies in (in order): uploaded file, form textfield, env var.
-    If found, attach opts['cookiefile'] = path.
-    """
-    # uploaded file has priority
-    cookie_path = _save_uploaded_cookiefile(tmpdir)
-    if not cookie_path:
-        cookie_path = _save_cookies_from_textfield(tmpdir)
-    if not cookie_path:
-        cookie_path = _write_env_cookies(tmpdir)
+    # priority: uploaded file -> textarea -> ENV
+    cookie_path = _save_uploaded_cookiefile(tmpdir) or \
+                  _save_cookies_from_textfield(tmpdir) or \
+                  _write_env_cookies(tmpdir)
     if cookie_path:
-        # yt-dlp uses 'cookiefile' or 'cookiesfrombrowser' flags
         opts["cookiefile"] = cookie_path
 
-
-# ---------- yt-dlp options helper ----------
+# ---------- yt-dlp options ----------
 def base_ydl_opts(tmpdir: str) -> Dict[str, Any]:
-    opts = {
+    opts: Dict[str, Any] = {
         "outtmpl": str(Path(tmpdir) / "%(title)s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -89,13 +69,13 @@ def base_ydl_opts(tmpdir: str) -> Dict[str, Any]:
         "concurrent_fragment_downloads": 8,
         "retries": 10,
         "fragment_retries": 10,
-        "http_chunk_size": 10485760,  # 10MB chunks
+        "http_chunk_size": 10485760,  # 10MB
+        "headers": {"User-Agent": "Mozilla/5.0"},
     }
     ffm = ffmpeg_path()
     if ffm:
         opts["ffmpeg_location"] = str(Path(ffm).parent)
     return opts
-
 
 # ---------- Helpers ----------
 def pick_download_file(tmpdir: str) -> Path:
@@ -103,7 +83,6 @@ def pick_download_file(tmpdir: str) -> Path:
     if not files:
         raise FileNotFoundError("No output file produced.")
     return max(files, key=lambda p: p.stat().st_size)
-
 
 def summarize_formats(info: Dict[str, Any]) -> Dict[str, Any]:
     title = info.get("title")
@@ -141,12 +120,33 @@ def summarize_formats(info: Dict[str, Any]) -> Dict[str, Any]:
         "uploader": info.get("uploader"),
     }
 
+# ---------- Safe send (disable kernel sendfile) ----------
+def send_file_no_sendfile(path: str, download_name: str):
+    """
+    Return a send_file() response but force-disable direct_passthrough so
+    gunicorn won't try os.sendfile() (which caused worker abort).
+    """
+    resp = send_file(
+        path,
+        as_attachment=True,
+        download_name=download_name,
+        mimetype="application/octet-stream",
+        max_age=0,
+        conditional=False,
+        etag=False,
+        last_modified=None,
+    )
+    # Important: avoid wsgi.file_wrapper / sendfile path
+    try:
+        resp.direct_passthrough = False
+    except Exception:
+        pass
+    return resp
 
 # ---------- Routes ----------
 @app.get("/")
 def index():
     return render_template("index.html", ffmpeg_ok=bool(ffmpeg_path()))
-
 
 @app.post("/api/formats")
 def api_formats():
@@ -157,7 +157,6 @@ def api_formats():
     tmpdir = tempfile.mkdtemp(prefix="probe_")
     try:
         opts = base_ydl_opts(tmpdir)
-        # attach cookie file if present (uploaded/form/ENV)
         attach_cookiefile_to_opts(opts, tmpdir)
         opts.update({"skip_download": True})
         try:
@@ -166,18 +165,14 @@ def api_formats():
             summary = summarize_formats(info)
             return jsonify({"ok": True, **summary})
         except Exception as e:
-            # if this looks like a cookies-needed message, include a hint
             err = str(e)
             if "Sign in to confirm" in err or "cookies" in err.lower():
-                hint = ("This video may require authentication. You can export cookies "
-                        "from your browser (Netscape cookies.txt) and either upload them "
-                        "or set the COOKIES_TEXT env variable.")
+                hint = ("This video may require authentication. Export cookies (Netscape cookies.txt) "
+                        "and upload them or set COOKIES_TEXT env.")
                 return jsonify({"ok": False, "error": err, "hint": hint}), 400
             return jsonify({"ok": False, "error": err}), 400
     finally:
-        # keep tmp for debug briefly? we remove it
         shutil.rmtree(tmpdir, ignore_errors=True)
-
 
 @app.post("/api/download")
 def api_download():
@@ -187,13 +182,10 @@ def api_download():
     if not url:
         return abort(400, "URL required")
 
-    # ffmpeg requirement for conversions/merging
     if not ffmpeg_path():
-        # If the server lacks ffmpeg, disallow audio conversion and merging where needed
         if mode == "audio":
             return abort(503, "FFmpeg not available on server (required for audio conversion).")
-        # In many cases merging requires ffmpeg; warn user
-        # we'll still attempt download but yt-dlp will likely fail if merge needed
+
     if not _sem.acquire(timeout=1):
         return abort(429, "Server busy. Try again in a moment.")
 
@@ -210,7 +202,6 @@ def api_download():
 
     try:
         opts = base_ydl_opts(tmpdir)
-        # attach cookies (uploaded text/file or env var)
         attach_cookiefile_to_opts(opts, tmpdir)
 
         if mode == "audio":
@@ -218,21 +209,17 @@ def api_download():
                 return abort(503, "Audio conversion disabled.")
             opts.update({
                 "format": format_id or "bestaudio/best",
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
             })
         else:
             chosen = f"{format_id}+bestaudio/best" if format_id else "bestvideo+bestaudio/best"
             opts.update({
                 "format": chosen,
-                "postprocessors": [
-                    {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
-                ],
+                "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
             })
 
         with YoutubeDL(opts) as ydl:
@@ -242,16 +229,14 @@ def api_download():
         base_title = info.get("title") or "video"
         download_name = f"{base_title}.mp3" if mode == "audio" else f"{base_title}{out_file.suffix}"
 
-        return send_file(str(out_file), as_attachment=True, download_name=download_name)
+        # ---- KEY FIX: avoid gunicorn sendfile path ----
+        return send_file_no_sendfile(str(out_file), download_name)
     except Exception as e:
-        # Provide clearer hint if it's cookies-related
         err = str(e)
         if "Sign in to confirm" in err or "cookies" in err.lower():
             return abort(400, ("Download failed and appears to require authentication (cookies). "
-                               "Export cookies (Netscape format) from your browser and either upload them "
-                               "with the form field named 'cookies' or set environment variable COOKIES_TEXT." ))
+                               "Upload cookies.txt or set COOKIES_TEXT env." ))
         return abort(500, f"Download failed: {e}")
-
 
 @app.get("/health")
 def health():
@@ -260,7 +245,6 @@ def health():
         "ffmpeg": ffmpeg_path() or "missing",
         "max_concurrent": MAX_CONCURRENT,
     }
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
