@@ -2,66 +2,85 @@ import os
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Dict, Any, Optional, List
-
-from flask import (
-    Flask,
-    render_template,
-    request,
-    jsonify,
-    abort,
-    Response,
-)
+from typing import Dict, Any, List, Optional
+from flask import Flask, render_template, request, jsonify, send_file, abort, after_this_request
 from yt_dlp import YoutubeDL
-from threading import Semaphore
 
 app = Flask(__name__)
 
 # ---------- Config ----------
+MAX_DURATION_SECONDS = int(os.environ.get("MAX_DURATION_SECONDS", "0"))  # 0 = no limit
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT", "2"))
+ENABLE_AUDIO_MP3 = True  # requires ffmpeg
+
+# simple in-process concurrency guard
+from threading import Semaphore
 _sem = Semaphore(MAX_CONCURRENT)
 
 
-# ---------- Utilities ----------
+# ---------- FFmpeg detection ----------
 def ffmpeg_path() -> Optional[str]:
-    """Return ffmpeg binary path if available."""
-    return shutil.which("ffmpeg") or os.environ.get("FFMPEG_PATH")
+    return os.environ.get("FFMPEG_PATH") or shutil.which("ffmpeg")
 
 
-def _write_cookies_if_any(tmpdir: str) -> Optional[str]:
+# ---------- Cookies helper ----------
+def _write_env_cookies(tmpdir: str) -> Optional[str]:
     """
-    Accept cookies from:
-      1) uploaded file <input name="cookies">
-      2) textarea 'cookies_text'
-      3) env var COOKIES_TEXT
-    Returns path to cookie file or None.
+    If COOKIES_TEXT env exists, write it to tmpdir/cookies.txt and return path.
     """
-    # 1) file upload
-    f = request.files.get("cookies")
-    if f and f.filename:
-        dst = Path(tmpdir) / "cookies.txt"
-        f.save(dst)
-        return str(dst)
+    txt = os.environ.get("COOKIES_TEXT", "").strip()
+    if not txt:
+        return None
+    p = Path(tmpdir) / "cookies_from_env.txt"
+    p.write_text(txt, encoding="utf-8")
+    return str(p)
 
-    # 2) textarea
-    raw = (request.form.get("cookies_text") or "").strip()
-    if raw:
-        dst = Path(tmpdir) / "cookies.txt"
-        dst.write_text(raw, encoding="utf-8")
-        return str(dst)
 
-    # 3) env var
-    env_raw = (os.environ.get("COOKIES_TEXT") or "").strip()
-    if env_raw:
-        dst = Path(tmpdir) / "cookies.txt"
-        dst.write_text(env_raw, encoding="utf-8")
-        return str(dst)
-
+def _save_uploaded_cookiefile(tmpdir: str) -> Optional[str]:
+    """
+    Save uploaded cookie file from form field named 'cookies' (file upload).
+    Return file path or None.
+    """
+    if 'cookies' in request.files:
+        f = request.files['cookies']
+        if f and f.filename:
+            dest = Path(tmpdir) / f.filename
+            f.save(str(dest))
+            return str(dest)
     return None
 
 
-def _base_ydl_opts(tmpdir: str, cookies_file: Optional[str]) -> Dict[str, Any]:
-    opts: Dict[str, Any] = {
+def _save_cookies_from_textfield(tmpdir: str) -> Optional[str]:
+    """
+    If client posts cookies text in 'cookies_text' field, write it and return path.
+    """
+    text = (request.form.get("cookies_text") or "").strip()
+    if not text:
+        return None
+    dest = Path(tmpdir) / "cookies_from_field.txt"
+    dest.write_text(text, encoding="utf-8")
+    return str(dest)
+
+
+def attach_cookiefile_to_opts(opts: Dict[str, Any], tmpdir: str):
+    """
+    Look for cookies in (in order): uploaded file, form textfield, env var.
+    If found, attach opts['cookiefile'] = path.
+    """
+    # uploaded file has priority
+    cookie_path = _save_uploaded_cookiefile(tmpdir)
+    if not cookie_path:
+        cookie_path = _save_cookies_from_textfield(tmpdir)
+    if not cookie_path:
+        cookie_path = _write_env_cookies(tmpdir)
+    if cookie_path:
+        # yt-dlp uses 'cookiefile' or 'cookiesfrombrowser' flags
+        opts["cookiefile"] = cookie_path
+
+
+# ---------- yt-dlp options helper ----------
+def base_ydl_opts(tmpdir: str) -> Dict[str, Any]:
+    opts = {
         "outtmpl": str(Path(tmpdir) / "%(title)s-%(id)s.%(ext)s"),
         "noplaylist": True,
         "quiet": True,
@@ -70,24 +89,31 @@ def _base_ydl_opts(tmpdir: str, cookies_file: Optional[str]) -> Dict[str, Any]:
         "concurrent_fragment_downloads": 8,
         "retries": 10,
         "fragment_retries": 10,
-        "http_chunk_size": 10 * 1024 * 1024,
-        "headers": {"User-Agent": "Mozilla/5.0"},
+        "http_chunk_size": 10485760,  # 10MB chunks
     }
-    if cookies_file:
-        opts["cookiefile"] = cookies_file
-
     ffm = ffmpeg_path()
     if ffm:
-        # yt-dlp expects a directory for ffmpeg binaries
         opts["ffmpeg_location"] = str(Path(ffm).parent)
     return opts
 
 
-def _summarize_formats(info: Dict[str, Any]) -> Dict[str, Any]:
-    vids: List[Dict[str, Any]] = []
-    auds: List[Dict[str, Any]] = []
+# ---------- Helpers ----------
+def pick_download_file(tmpdir: str) -> Path:
+    files = list(Path(tmpdir).glob("*"))
+    if not files:
+        raise FileNotFoundError("No output file produced.")
+    return max(files, key=lambda p: p.stat().st_size)
+
+
+def summarize_formats(info: Dict[str, Any]) -> Dict[str, Any]:
+    title = info.get("title")
+    duration = info.get("duration")
+    if MAX_DURATION_SECONDS and duration and duration > MAX_DURATION_SECONDS:
+        raise ValueError(f"Video too long ({duration}s > limit {MAX_DURATION_SECONDS}s).")
+
+    vids, auds = [], []
     for f in info.get("formats", []):
-        d = {
+        fmt = {
             "format_id": f.get("format_id"),
             "ext": f.get("ext"),
             "acodec": f.get("acodec"),
@@ -95,90 +121,31 @@ def _summarize_formats(info: Dict[str, Any]) -> Dict[str, Any]:
             "fps": f.get("fps"),
             "height": f.get("height"),
             "filesize": f.get("filesize") or f.get("filesize_approx"),
+            "format_note": f.get("format_note"),
         }
-        if d["vcodec"] and d["vcodec"] != "none":
-            vids.append(d)
-        if (d["vcodec"] in (None, "none")) and d["acodec"] and d["acodec"] != "none":
-            auds.append(d)
+        if fmt["vcodec"] and fmt["vcodec"] != "none":
+            vids.append(fmt)
+        if (fmt["vcodec"] in (None, "none")) and fmt["acodec"] and fmt["acodec"] != "none":
+            auds.append(fmt)
 
     vids.sort(key=lambda x: (x.get("height") or 0, x.get("fps") or 0), reverse=True)
     auds.sort(key=lambda x: (x.get("filesize") or 0), reverse=True)
 
     return {
-        "title": info.get("title"),
-        "duration": info.get("duration"),
+        "title": title,
+        "duration": duration,
         "thumbnail": info.get("thumbnail"),
-        "uploader": info.get("uploader"),
         "video_formats": vids,
         "audio_formats": auds,
+        "webpage_url": info.get("webpage_url"),
+        "uploader": info.get("uploader"),
     }
-
-
-def _guess_mimetype(suffix: str, audio_mode: bool) -> str:
-    if audio_mode:
-        # we produce mp3 in audio mode
-        return "audio/mpeg"
-    if suffix.lower() == ".mp4":
-        return "video/mp4"
-    if suffix.lower() == ".webm":
-        return "video/webm"
-    return "application/octet-stream"
-
-
-def _stream_file_and_cleanup(file_path: Path, download_name: str, tmpdir: str, audio_mode: bool) -> Response:
-    """
-    Stream file in chunks (avoids Gunicorn sendfile path) and
-    remove the tmpdir *after* the response is fully sent.
-    """
-    def generate():
-        with open(file_path, "rb") as f:
-            while True:
-                chunk = f.read(1024 * 1024)  # 1 MB
-                if not chunk:
-                    break
-                yield chunk
-
-    resp = Response(generate(), mimetype=_guess_mimetype(file_path.suffix, audio_mode))
-    resp.headers["Content-Disposition"] = f'attachment; filename="{download_name}"'
-    try:
-        resp.headers["Content-Length"] = str(file_path.stat().st_size)
-    except Exception:
-        pass
-
-    # clean after the stream finishes
-    def _cleanup():
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
-
-    resp.call_on_close(_cleanup)
-    return resp
 
 
 # ---------- Routes ----------
 @app.get("/")
 def index():
-    # simple inline page so you can test
-    return """
-<!doctype html>
-<title>Smart Video Downloader</title>
-<h2>Smart Video Downloader</h2>
-<p>FFmpeg: {ffmpeg}</p>
-<form id="probe" method="post" action="/api/formats" enctype="multipart/form-data">
-  <input name="url" placeholder="Paste URL" style="width:420px" required>
-  <input type="file" name="cookies" accept=".txt">
-  <button type="submit">Get Options</button>
-</form>
-<details><summary>Paste cookies.txt</summary>
-  <form method="post" action="/api/formats" enctype="multipart/form-data">
-    <input name="url" placeholder="Paste URL" style="width:420px" required>
-    <textarea name="cookies_text" rows="4" cols="60"></textarea>
-    <button type="submit">Get Options</button>
-  </form>
-</details>
-<p>Use API from your own UI: <code>/api/formats</code> then <code>/api/download</code></p>
-""".format(ffmpeg=("available" if ffmpeg_path() else "missing"))
+    return render_template("index.html", ffmpeg_ok=bool(ffmpeg_path()))
 
 
 @app.post("/api/formats")
@@ -187,85 +154,114 @@ def api_formats():
     if not url:
         return jsonify({"ok": False, "error": "URL required"}), 400
 
-    with tempfile.TemporaryDirectory(prefix="probe_") as tmpdir:
-        cookies_file = _write_cookies_if_any(tmpdir)
-        opts = _base_ydl_opts(tmpdir, cookies_file)
-        opts["skip_download"] = True
+    tmpdir = tempfile.mkdtemp(prefix="probe_")
+    try:
+        opts = base_ydl_opts(tmpdir)
+        # attach cookie file if present (uploaded/form/ENV)
+        attach_cookiefile_to_opts(opts, tmpdir)
+        opts.update({"skip_download": True})
         try:
             with YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=False)
-            return jsonify({"ok": True, **_summarize_formats(info)})
+            summary = summarize_formats(info)
+            return jsonify({"ok": True, **summary})
         except Exception as e:
-            return jsonify({"ok": False, "error": str(e)}), 400
+            # if this looks like a cookies-needed message, include a hint
+            err = str(e)
+            if "Sign in to confirm" in err or "cookies" in err.lower():
+                hint = ("This video may require authentication. You can export cookies "
+                        "from your browser (Netscape cookies.txt) and either upload them "
+                        "or set the COOKIES_TEXT env variable.")
+                return jsonify({"ok": False, "error": err, "hint": hint}), 400
+            return jsonify({"ok": False, "error": err}), 400
+    finally:
+        # keep tmp for debug briefly? we remove it
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @app.post("/api/download")
 def api_download():
     url = (request.form.get("url") or "").strip()
-    mode = (request.form.get("mode") or "video").strip()  # 'video' or 'audio'
+    mode = (request.form.get("mode") or "video").strip()
     format_id = (request.form.get("format_id") or "").strip() or None
-
     if not url:
         return abort(400, "URL required")
 
+    # ffmpeg requirement for conversions/merging
     if not ffmpeg_path():
-        return abort(503, "FFmpeg not available on server.")
-
+        # If the server lacks ffmpeg, disallow audio conversion and merging where needed
+        if mode == "audio":
+            return abort(503, "FFmpeg not available on server (required for audio conversion).")
+        # In many cases merging requires ffmpeg; warn user
+        # we'll still attempt download but yt-dlp will likely fail if merge needed
     if not _sem.acquire(timeout=1):
-        return abort(429, "Server busy. Try again shortly.")
+        return abort(429, "Server busy. Try again in a moment.")
 
     tmpdir = tempfile.mkdtemp(prefix="ydl_")
-    try:
-        cookies_file = _write_cookies_if_any(tmpdir)
-        opts = _base_ydl_opts(tmpdir, cookies_file)
 
-        # Choose formats & postprocessors
+    @after_this_request
+    def cleanup(response):
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+        _sem.release()
+        return response
+
+    try:
+        opts = base_ydl_opts(tmpdir)
+        # attach cookies (uploaded text/file or env var)
+        attach_cookiefile_to_opts(opts, tmpdir)
+
         if mode == "audio":
+            if not ENABLE_AUDIO_MP3:
+                return abort(503, "Audio conversion disabled.")
             opts.update({
                 "format": format_id or "bestaudio/best",
                 "postprocessors": [
-                    {"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
                 ],
             })
         else:
             chosen = f"{format_id}+bestaudio/best" if format_id else "bestvideo+bestaudio/best"
             opts.update({
                 "format": chosen,
-                "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}],
+                "postprocessors": [
+                    {"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}
+                ],
             })
 
         with YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
 
-        # pick largest output file
-        out_files = list(Path(tmpdir).glob("*"))
-        if not out_files:
-            return abort(500, "No output produced.")
-        out_file = max(out_files, key=lambda p: p.stat().st_size)
-
+        out_file = pick_download_file(tmpdir)
         base_title = info.get("title") or "video"
         download_name = f"{base_title}.mp3" if mode == "audio" else f"{base_title}{out_file.suffix}"
 
-        # Stream (no sendfile) and cleanup when done
-        resp = _stream_file_and_cleanup(out_file, download_name, tmpdir, audio_mode=(mode == "audio"))
-        return resp
-
+        return send_file(str(out_file), as_attachment=True, download_name=download_name)
     except Exception as e:
-        # if we error, still cleanup now
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
+        # Provide clearer hint if it's cookies-related
+        err = str(e)
+        if "Sign in to confirm" in err or "cookies" in err.lower():
+            return abort(400, ("Download failed and appears to require authentication (cookies). "
+                               "Export cookies (Netscape format) from your browser and either upload them "
+                               "with the form field named 'cookies' or set environment variable COOKIES_TEXT." ))
         return abort(500, f"Download failed: {e}")
-    finally:
-        _sem.release()
 
 
 @app.get("/health")
 def health():
-    return {"ok": True, "ffmpeg": ffmpeg_path() or "missing", "max_concurrent": MAX_CONCURRENT}
+    return {
+        "ok": True,
+        "ffmpeg": ffmpeg_path() or "missing",
+        "max_concurrent": MAX_CONCURRENT,
+    }
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=port)
