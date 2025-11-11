@@ -8,4 +8,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . /app
 
 # Shell form so $PORT expands (fallback 8000 if not set)
-CMD sh -c 'gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1'
+CMD gunicorn app:app --bind 0.0.0.0:${PORT:-8000} --workers 1
