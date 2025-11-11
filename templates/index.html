@@ -1,1 +1,203 @@
-hii
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Smart Video Downloader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+  <style>
+    :root{ --bg:#0b1220; --card:#0f172a; --muted:#9aa5b1; --text:#e5e7eb; --accent:#22c55e; --border:#1f2937; --danger:#ef4444;}
+    *{box-sizing:border-box} body{margin:0;background:radial-gradient(1200px 600px at 20% -10%, rgba(34,197,94,.15), transparent), linear-gradient(180deg,#0b1220,#0b1220 40%,#0a0f1f 100%);color:var(--text);font-family:Inter,system-ui,Segoe UI,Roboto,Arial,sans-serif}
+    .wrap{max-width:980px;margin:32px auto;padding:0 16px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:18px;box-shadow:0 10px 30px rgba(0,0,0,.35);overflow:hidden}
+    .header{padding:20px 24px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center}
+    .brand{font-weight:800;font-size:18px;letter-spacing:.3px}
+    .badge{font-size:12px;border:1px solid var(--border);border-radius:999px;padding:6px 10px;color:var(--muted)}
+    .body{padding:24px}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    input,select,button{border-radius:12px;border:1px solid var(--border);background:#0b1220;color:var(--text);padding:12px 14px;font-size:15px}
+    input,select{flex:1;min-width:240px}
+    button{cursor:pointer;background:var(--accent);color:#04130a;border:none;font-weight:800;transition:transform .04s ease}
+    button:active{transform:translateY(1px)}
+    button.secondary{background:#0b1220;color:var(--muted);border:1px solid var(--border);font-weight:600}
+    .muted{color:var(--muted);font-size:14px}
+    .meta{display:flex;gap:16px;align-items:center;margin-top:16px}
+    .thumb{width:200px;height:112px;background:#0b1220;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+    .thumb img{width:100%;height:100%;object-fit:cover}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px;margin-top:16px}
+    .pill{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid var(--border);font-size:12px;color:var(--muted)}
+    .toast{position:fixed;right:16px;bottom:16px;background:#08101e;border:1px solid var(--border);padding:12px 14px;border-radius:12px;display:none}
+    .error{color:#fee2e2;border-color:rgba(239,68,68,.35)}
+    .success{color:#dcfce7;border-color:rgba(34,197,94,.35)}
+    .filters{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}
+    .chip{border:1px solid var(--border);padding:6px 10px;border-radius:999px;font-size:12px;cursor:pointer;color:var(--muted)}
+    .chip.active{background:#142032;color:#d1fae5;border-color:#134e4a}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="header">
+        <div class="brand">Smart Video Downloader</div>
+        <div class="badge" id="ffmpeg-badge">FFmpeg: checking…</div>
+      </div>
+      <div class="body">
+        <form id="probe-form" class="row" onsubmit="return false;">
+          <input id="url" name="url" placeholder="Paste video URL (YouTube, etc.)" required />
+          <button id="probe-btn" type="button">Get Options</button>
+        </form>
+
+        <div class="filters" id="filters" style="display:none">
+          <div class="chip" data-filter="all">All</div>
+          <div class="chip" data-filter="1080">1080p+</div>
+          <div class="chip" data-filter="720">720p</div>
+          <div class="chip" data-filter="480">480p</div>
+          <div class="chip" data-filter="audio">Audio</div>
+        </div>
+
+        <div id="video-meta" style="display:none;">
+          <div class="meta">
+            <div class="thumb"><img id="thumb" alt="thumbnail" /></div>
+            <div>
+              <div id="title" style="font-weight:800;font-size:18px"></div>
+              <div class="muted" id="duration"></div>
+              <div class="muted" id="uploader"></div>
+            </div>
+          </div>
+
+          <form id="download-form" class="grid" method="POST" action="/api/download">
+            <input type="hidden" name="url" id="dl-url" />
+            <input type="hidden" name="mode" id="mode" value="video" />
+            <select id="format-select" name="format_id" style="display:none"></select>
+
+            <div id="video-col">
+              <div class="muted">Video quality</div>
+              <select id="video-select"></select>
+              <div class="muted">MP4 merged with best audio</div>
+            </div>
+
+            <div id="audio-col">
+              <div class="muted">Audio only</div>
+              <select id="audio-select"></select>
+              <div class="muted">MP3 192 kbps</div>
+            </div>
+
+            <div style="display:flex; gap:8px; align-items:end;">
+              <button type="submit" id="btn-video">Download Video</button>
+              <button type="submit" class="secondary" id="btn-audio">Download Audio</button>
+            </div>
+          </form>
+        </div>
+
+        <div id="msg" class="muted" style="margin-top:12px"></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const ffmpegBadge = document.getElementById('ffmpeg-badge');
+    fetch('/health').then(r=>r.json()).then(d=>{
+      ffmpegBadge.textContent = 'FFmpeg: ' + (d.ffmpeg && d.ffmpeg !== 'missing' ? 'available' : 'missing');
+      if(d.ffmpeg === 'missing'){ ffmpegBadge.classList.add('error'); } else { ffmpegBadge.classList.add('success'); }
+    }).catch(()=>{ ffmpegBadge.textContent='FFmpeg: unknown'; });
+
+    function showToast(text, isError=false){
+      const t=document.getElementById('toast');
+      t.textContent=text; t.style.display='block';
+      t.className = 'toast ' + (isError? 'error':'success');
+      setTimeout(()=>{ t.style.display='none'; }, 4000);
+    }
+
+    function bytesToSize(bytes){
+      if(!bytes) return ''; const sizes=['B','KB','MB','GB','TB'];
+      const i=Math.floor(Math.log(bytes)/Math.log(1024));
+      return (bytes/Math.pow(1024,i)).toFixed(1)+' '+sizes[i];
+    }
+
+    function setMode(m){
+      document.getElementById('mode').value = m;
+      const selected = (m==='audio'? document.getElementById('audio-select').value : document.getElementById('video-select').value);
+      document.getElementById('format-select').value = selected;
+    }
+
+    function applyFilter(which){
+      const videoSelect = document.getElementById('video-select');
+      for(const opt of videoSelect.options){
+        const h = parseInt((opt.dataset.height||'0'),10);
+        let ok = true;
+        if(which==='1080') ok = h>=1080;
+        else if(which==='720') ok = h>=720 && h<1080;
+        else if(which==='480') ok = h>=360 && h<720;
+        else if(which==='audio') ok = false;
+        opt.hidden = !ok;
+      }
+    }
+
+    async function probe(){
+      const url = document.getElementById('url').value.trim();
+      if(!url){ return; }
+      document.getElementById('msg').textContent = 'Fetching formats...';
+
+      const fd = new FormData(); fd.append('url', url);
+      const r = await fetch('/api/formats', { method: 'POST', body: fd });
+      const data = await r.json();
+
+      if(!data.ok){
+        document.getElementById('msg').textContent = 'Error: ' + (data.error || 'Unknown error');
+        showToast(data.error || 'Failed', true);
+        return;
+      }
+
+      document.getElementById('msg').textContent = '';
+      document.getElementById('video-meta').style.display = 'block';
+      document.getElementById('filters').style.display = 'flex';
+      document.getElementById('dl-url').value = url;
+
+      document.getElementById('title').textContent = data.title || 'Untitled';
+      document.getElementById('duration').textContent = data.duration ? ('Duration: ' + data.duration + 's') : '';
+      document.getElementById('uploader').textContent = data.uploader ? ('By ' + data.uploader) : '';
+      document.getElementById('thumb').src = data.thumbnail || '';
+
+      const vSel = document.getElementById('video-select');
+      const aSel = document.getElementById('audio-select');
+      const fSel = document.getElementById('format-select');
+      vSel.innerHTML = ''; aSel.innerHTML = ''; fSel.innerHTML = '';
+
+      (data.video_formats || []).forEach(f => {
+        const label = [f.height? (f.height+'p'):'', f.fps? (f.fps+'fps'):'', f.vcodec||'', f.ext||'', f.filesize? bytesToSize(f.filesize):''].filter(Boolean).join(' · ');
+        const opt = document.createElement('option');
+        opt.value = f.format_id; opt.textContent = label; opt.dataset.height = f.height||0;
+        vSel.appendChild(opt);
+      });
+
+      (data.audio_formats || []).forEach(f => {
+        const label = [f.acodec||'', f.ext||'', f.filesize? bytesToSize(f.filesize):''].filter(Boolean).join(' · ');
+        const opt = document.createElement('option');
+        opt.value = f.format_id; opt.textContent = label;
+        aSel.appendChild(opt);
+      });
+
+      const opt = document.createElement('option'); // keep hidden sync input aligned
+      fSel.appendChild(opt);
+      document.getElementById('format-select').value = vSel.value;
+    }
+
+    document.getElementById('probe-btn').addEventListener('click', probe);
+    document.getElementById('btn-video').addEventListener('click', ()=>setMode('video'));
+    document.getElementById('btn-audio').addEventListener('click', ()=>setMode('audio'));
+
+    // filter chips
+    document.querySelectorAll('.chip').forEach(chip=>{
+      chip.addEventListener('click', ()=>{
+        document.querySelectorAll('.chip').forEach(c=>c.classList.remove('active'));
+        chip.classList.add('active');
+        applyFilter(chip.dataset.filter);
+      });
+    });
+  </script>
+</body>
+</html>
